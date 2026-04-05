@@ -31,6 +31,7 @@ namespace PriorityControl.UI
 
         private bool _isInitializing;
         private bool _isGridEditing;
+        private bool _startupModeInitialized;
 
         private DataGridView _grid;
         private Button _addButton;
@@ -51,6 +52,12 @@ namespace PriorityControl.UI
             _launchArgs = launchArgs ?? new string[0];
 
             InitializeComponent();
+
+            if (_startedFromStartup)
+            {
+                ConfigureStartupBackgroundMode();
+            }
+
             LoadFromSettings();
             UpdateAdminState();
             RefreshAllStatuses();
@@ -71,9 +78,12 @@ namespace PriorityControl.UI
         {
             base.OnShown(e);
 
-            if (_startedFromStartup)
+            if (_startedFromStartup && !_startupModeInitialized)
             {
+                _startupModeInitialized = true;
+                Hide();
                 StartConfiguredStartupEntries();
+                Close();
             }
         }
 
@@ -259,6 +269,12 @@ namespace PriorityControl.UI
 
             bool runValueEnabled = _startupService.IsEnabled();
             _startWithWindowsCheckBox.Checked = settings.StartWithWindows && runValueEnabled;
+
+            if (_startWithWindowsCheckBox.Checked)
+            {
+                _startupService.RefreshExecutablePathIfEnabled(Application.ExecutablePath);
+            }
+
             _isInitializing = false;
 
             ClearGridSelection();
@@ -359,146 +375,176 @@ namespace PriorityControl.UI
 
         private void StartButton_Click(object sender, EventArgs e)
         {
-            List<AppEntry> selectedEntries = GetSelectedEntries();
-            if (selectedEntries.Count == 0)
+            _statusTimer.Stop();
+            UseWaitCursor = true;
+            try
             {
-                SetInfo("Select at least one entry to start.", true);
-                return;
-            }
-
-            bool needsAdmin = selectedEntries.Any(entry =>
-                entry.Priority == FixedPriority.High || entry.Priority == FixedPriority.Realtime);
-
-            if (needsAdmin && !_elevationService.IsAdministrator)
-            {
-                DialogResult result = MessageBox.Show(
-                    this,
-                    "High/Realtime priorities require administrator rights.\nRestart PriorityControl as administrator now?",
-                    "Administrator rights required",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Warning);
-
-                if (result == DialogResult.Yes)
+                List<AppEntry> selectedEntries = GetSelectedEntries();
+                if (selectedEntries.Count == 0)
                 {
-                    string restartError;
-                    if (_elevationService.TryRestartElevated(_launchArgs, out restartError))
-                    {
-                        Close();
-                        return;
-                    }
-
-                    SetInfo(restartError, true);
+                    SetInfo("Select at least one entry to start.", true);
                     return;
                 }
 
-                SetInfo("Start canceled: administrator rights were not granted.", true);
-                return;
-            }
+                bool needsAdmin = selectedEntries.Any(entry =>
+                    entry.Priority == FixedPriority.High || entry.Priority == FixedPriority.Realtime);
 
-            int startedCount = 0;
-            var errors = new StringBuilder();
-
-            foreach (AppEntry entry in selectedEntries)
-            {
-                string startError;
-                if (_processService.StartWithFixedPriority(entry, out startError))
+                if (needsAdmin && !_elevationService.IsAdministrator)
                 {
-                    startedCount++;
+                    DialogResult result = MessageBox.Show(
+                        this,
+                        "High/Realtime priorities require administrator rights.\nRestart PriorityControl as administrator now?",
+                        "Administrator rights required",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Warning);
+
+                    if (result == DialogResult.Yes)
+                    {
+                        string restartError;
+                        if (_elevationService.TryRestartElevated(_launchArgs, out restartError))
+                        {
+                            Close();
+                            return;
+                        }
+
+                        SetInfo(restartError, true);
+                        return;
+                    }
+
+                    SetInfo("Start canceled: administrator rights were not granted.", true);
+                    return;
                 }
-                else
+
+                int startedCount = 0;
+                var errors = new StringBuilder();
+
+                foreach (AppEntry entry in selectedEntries)
                 {
-                    errors.AppendLine(Path.GetFileName(entry.ExePath) + ": " + startError);
+                    string startError;
+                    if (_processService.StartWithFixedPriority(entry, out startError))
+                    {
+                        startedCount++;
+                    }
+                    else
+                    {
+                        errors.AppendLine(Path.GetFileName(entry.ExePath) + ": " + startError);
+                    }
                 }
+
+                RefreshAllStatuses();
+                SaveSettings();
+
+                if (errors.Length > 0)
+                {
+                    MessageBox.Show(this, errors.ToString(), "Start errors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+
+                SetInfo(string.Format("Started {0} {1} with fixed priority.", startedCount, EntryWord(startedCount)));
             }
-
-            RefreshAllStatuses();
-            SaveSettings();
-
-            if (errors.Length > 0)
+            finally
             {
-                MessageBox.Show(this, errors.ToString(), "Start errors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                UseWaitCursor = false;
+                _statusTimer.Start();
             }
-
-            SetInfo(string.Format("Started {0} {1} with fixed priority.", startedCount, EntryWord(startedCount)));
         }
 
         private void LockButton_Click(object sender, EventArgs e)
         {
-            List<AppEntry> selectedEntries = GetSelectedEntries();
-            if (selectedEntries.Count == 0)
+            _statusTimer.Stop();
+            UseWaitCursor = true;
+            try
             {
-                SetInfo("Select entries to lock.", true);
-                return;
-            }
-
-            bool needsAdmin = selectedEntries.Any(entry =>
-                entry.Priority == FixedPriority.High || entry.Priority == FixedPriority.Realtime);
-
-            if (needsAdmin && !_elevationService.IsAdministrator)
-            {
-                SetInfo("High/Realtime lock requires administrator rights.", true);
-                return;
-            }
-
-            int locked = 0;
-            var errors = new StringBuilder();
-
-            foreach (AppEntry entry in selectedEntries)
-            {
-                string lockError;
-                if (_processService.ApplyPriorityLock(entry, out lockError))
+                List<AppEntry> selectedEntries = GetSelectedEntries();
+                if (selectedEntries.Count == 0)
                 {
-                    locked++;
+                    SetInfo("Select entries to lock.", true);
+                    return;
                 }
-                else
+
+                bool needsAdmin = selectedEntries.Any(entry =>
+                    entry.Priority == FixedPriority.High || entry.Priority == FixedPriority.Realtime);
+
+                if (needsAdmin && !_elevationService.IsAdministrator)
                 {
-                    errors.AppendLine(Path.GetFileName(entry.ExePath) + ": " + lockError);
+                    SetInfo("High/Realtime lock requires administrator rights.", true);
+                    return;
                 }
+
+                int locked = 0;
+                var errors = new StringBuilder();
+
+                foreach (AppEntry entry in selectedEntries)
+                {
+                    string lockError;
+                    if (_processService.ApplyPriorityLock(entry, out lockError))
+                    {
+                        locked++;
+                    }
+                    else
+                    {
+                        errors.AppendLine(Path.GetFileName(entry.ExePath) + ": " + lockError);
+                    }
+                }
+
+                RefreshAllStatuses();
+
+                if (errors.Length > 0)
+                {
+                    MessageBox.Show(this, errors.ToString(), "Lock errors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+
+                SetInfo(string.Format("Applied priority lock for {0} {1}.", locked, EntryWord(locked)));
             }
-
-            RefreshAllStatuses();
-
-            if (errors.Length > 0)
+            finally
             {
-                MessageBox.Show(this, errors.ToString(), "Lock errors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                UseWaitCursor = false;
+                _statusTimer.Start();
             }
-
-            SetInfo(string.Format("Applied priority lock for {0} {1}.", locked, EntryWord(locked)));
         }
 
         private void UnlockButton_Click(object sender, EventArgs e)
         {
-            List<AppEntry> selectedEntries = GetSelectedEntries();
-            if (selectedEntries.Count == 0)
+            _statusTimer.Stop();
+            UseWaitCursor = true;
+            try
             {
-                SetInfo("Select entries to unlock.", true);
-                return;
-            }
-
-            int unlocked = 0;
-            var errors = new StringBuilder();
-
-            foreach (AppEntry entry in selectedEntries)
-            {
-                string unlockError;
-                if (_processService.RemovePriorityLock(entry, out unlockError))
+                List<AppEntry> selectedEntries = GetSelectedEntries();
+                if (selectedEntries.Count == 0)
                 {
-                    unlocked++;
+                    SetInfo("Select entries to unlock.", true);
+                    return;
                 }
-                else
+
+                int unlocked = 0;
+                var errors = new StringBuilder();
+
+                foreach (AppEntry entry in selectedEntries)
                 {
-                    errors.AppendLine(Path.GetFileName(entry.ExePath) + ": " + unlockError);
+                    string unlockError;
+                    if (_processService.RemovePriorityLock(entry, out unlockError))
+                    {
+                        unlocked++;
+                    }
+                    else
+                    {
+                        errors.AppendLine(Path.GetFileName(entry.ExePath) + ": " + unlockError);
+                    }
                 }
+
+                RefreshAllStatuses();
+
+                if (errors.Length > 0)
+                {
+                    MessageBox.Show(this, errors.ToString(), "Unlock errors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+
+                SetInfo(string.Format("Removed priority lock for {0} {1}.", unlocked, EntryWord(unlocked)));
             }
-
-            RefreshAllStatuses();
-
-            if (errors.Length > 0)
+            finally
             {
-                MessageBox.Show(this, errors.ToString(), "Unlock errors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                UseWaitCursor = false;
+                _statusTimer.Start();
             }
-
-            SetInfo(string.Format("Removed priority lock for {0} {1}.", unlocked, EntryWord(unlocked)));
         }
 
         private void RestartAsAdminButton_Click(object sender, EventArgs e)
@@ -647,7 +693,7 @@ namespace PriorityControl.UI
                 }
 
                 string startError;
-                if (_processService.StartWithFixedPriority(entry, out startError))
+                if (_processService.StartWithFixedPriority(entry, true, out startError))
                 {
                     started++;
                 }
@@ -727,6 +773,13 @@ namespace PriorityControl.UI
             _grid.ClearSelection();
             _grid.CurrentCell = null;
             UpdateButtonsState();
+        }
+
+        private void ConfigureStartupBackgroundMode()
+        {
+            ShowInTaskbar = false;
+            WindowState = FormWindowState.Minimized;
+            Opacity = 0;
         }
     }
 }

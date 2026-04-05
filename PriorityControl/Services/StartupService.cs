@@ -11,11 +11,6 @@ namespace PriorityControl.Services
 
         public bool IsEnabled()
         {
-            if (IsScheduledTaskEnabled())
-            {
-                return true;
-            }
-
             return IsRunKeyEnabled();
         }
 
@@ -23,18 +18,23 @@ namespace PriorityControl.Services
         {
             if (enabled)
             {
-                if (TryCreateOrUpdateScheduledTask(executablePath))
-                {
-                    RemoveRunKey();
-                    return;
-                }
-
                 SetRunKey(executablePath);
+                DeleteScheduledTaskBestEffort();
                 return;
             }
 
             RemoveRunKey();
-            DeleteScheduledTask();
+            DeleteScheduledTaskBestEffort();
+        }
+
+        public void RefreshExecutablePathIfEnabled(string executablePath)
+        {
+            if (!IsEnabled())
+            {
+                return;
+            }
+
+            SetRunKey(executablePath);
         }
 
         private static bool IsRunKeyEnabled()
@@ -67,39 +67,7 @@ namespace PriorityControl.Services
             }
         }
 
-        private static bool IsScheduledTaskEnabled()
-        {
-            int exitCode = RunSchtasks("/Query /TN \"" + TaskName + "\"");
-            return exitCode == 0;
-        }
-
-        private static bool TryCreateOrUpdateScheduledTask(string executablePath)
-        {
-            string action = "\\\"" + executablePath + "\\\" --startup";
-
-            string argsHighest =
-                "/Create /TN \"" +
-                TaskName +
-                "\" /TR \"" +
-                action +
-                "\" /SC ONLOGON /RL HIGHEST /F";
-
-            if (RunSchtasks(argsHighest) == 0)
-            {
-                return true;
-            }
-
-            string argsLimited =
-                "/Create /TN \"" +
-                TaskName +
-                "\" /TR \"" +
-                action +
-                "\" /SC ONLOGON /RL LIMITED /F";
-
-            return RunSchtasks(argsLimited) == 0;
-        }
-
-        private static void DeleteScheduledTask()
+        private static void DeleteScheduledTaskBestEffort()
         {
             RunSchtasks("/Delete /TN \"" + TaskName + "\" /F");
         }
@@ -125,7 +93,7 @@ namespace PriorityControl.Services
                         return -1;
                     }
 
-                    process.WaitForExit(10000);
+                    process.WaitForExit(5000);
                     return process.ExitCode;
                 }
             }

@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 using System.Runtime.InteropServices;
 
 namespace PriorityControl.Native
@@ -18,6 +19,13 @@ namespace PriorityControl.Native
         public const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
         public const uint SE_PRIVILEGE_ENABLED = 0x00000002;
         public const int ERROR_NOT_ALL_ASSIGNED = 1300;
+        public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        public const uint PROCESS_DUP_HANDLE = 0x0040;
+        public const uint JOB_OBJECT_ASSIGN_PROCESS = 0x0001;
+        public const uint JOB_OBJECT_SET_ATTRIBUTES = 0x0002;
+        public const uint JOB_OBJECT_QUERY = 0x0004;
+        public const uint DUPLICATE_SAME_ACCESS = 0x00000002;
+        public const uint CREATE_SUSPENDED = 0x00000004;
 
         public enum JOBOBJECTINFOCLASS
         {
@@ -72,6 +80,38 @@ namespace PriorityControl.Native
             public uint Attributes;
         }
 
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct STARTUPINFO
+        {
+            public uint cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public uint dwX;
+            public uint dwY;
+            public uint dwXSize;
+            public uint dwYSize;
+            public uint dwXCountChars;
+            public uint dwYCountChars;
+            public uint dwFillAttribute;
+            public uint dwFlags;
+            public short wShowWindow;
+            public short cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PROCESS_INFORMATION
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public uint dwProcessId;
+            public uint dwThreadId;
+        }
+
         // Extended structure contains the BasicLimitInformation block.
         // We use it because it supports JOB_OBJECT_LIMIT_PRIORITY_CLASS
         // through BasicLimitInformation.LimitFlags and PriorityClass.
@@ -88,6 +128,12 @@ namespace PriorityControl.Native
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern SafeJobHandle CreateJobObject(IntPtr lpJobAttributes, string lpName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern SafeJobHandle OpenJobObject(
+            uint dwDesiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle,
+            string lpName);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -127,6 +173,51 @@ namespace PriorityControl.Native
             IntPtr ProcessHandle,
             IntPtr JobHandle,
             [MarshalAs(UnmanagedType.Bool)] out bool Result);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool DuplicateHandle(
+            IntPtr hSourceProcessHandle,
+            IntPtr hSourceHandle,
+            IntPtr hTargetProcessHandle,
+            out IntPtr lpTargetHandle,
+            uint dwDesiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle,
+            uint dwOptions);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(
+            uint dwDesiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle,
+            int dwProcessId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool QueryFullProcessImageName(
+            IntPtr hProcess,
+            int dwFlags,
+            StringBuilder lpExeName,
+            ref int lpdwSize);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CreateProcess(
+            string lpApplicationName,
+            string lpCommandLine,
+            IntPtr lpProcessAttributes,
+            IntPtr lpThreadAttributes,
+            [MarshalAs(UnmanagedType.Bool)] bool bInheritHandles,
+            uint dwCreationFlags,
+            IntPtr lpEnvironment,
+            string lpCurrentDirectory,
+            ref STARTUPINFO lpStartupInfo,
+            out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint ResumeThread(IntPtr hThread);
 
         [DllImport("advapi32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]

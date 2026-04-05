@@ -1,8 +1,10 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 using PriorityControl.Models;
 using PriorityControl.Native;
 
@@ -10,47 +12,26 @@ namespace PriorityControl.Services
 {
     internal sealed class PriorityProcessService : IDisposable
     {
-        private sealed class RuntimeState : IDisposable
-        {
-            public RuntimeState(Process process, SafeJobHandle jobHandle, bool lockActive)
-            {
-                Process = process;
-                JobHandle = jobHandle;
-                IsLockActive = lockActive;
-            }
+        private const uint KnownJobAccess =
+            NativeMethods.JOB_OBJECT_QUERY |
+            NativeMethods.JOB_OBJECT_SET_ATTRIBUTES |
+            NativeMethods.JOB_OBJECT_ASSIGN_PROCESS;
 
-            public Process Process { get; private set; }
-            public SafeJobHandle JobHandle { get; private set; }
-            public bool IsLockActive { get; set; }
+        private const int BindRetryIntervalMs = 100;
+        private const int BindDurationNewProcessMs = 2000;
+        private const int BindDurationExistingProcessMs = 800;
 
-            public void Dispose()
-            {
-                if (Process != null)
-                {
-                    Process.Dispose();
-                }
-
-                if (JobHandle != null)
-                {
-                    JobHandle.Dispose();
-                }
-            }
-        }
-
-        private sealed class ExternalProcessSnapshot
-        {
-            public int ProcessId;
-            public string PriorityDisplay;
-            public bool IsInAnyJob;
-        }
-
-        private readonly Dictionary<string, RuntimeState> _states =
-            new Dictionary<string, RuntimeState>(StringComparer.OrdinalIgnoreCase);
+        private static readonly string[] JobNamePrefixes = { "Global\\", string.Empty };
 
         private readonly JobObjectService _jobObjectService = new JobObjectService();
         private readonly PrivilegeService _privilegeService = new PrivilegeService();
 
         public bool StartWithFixedPriority(AppEntry entry, out string error)
+        {
+            return StartWithFixedPriority(entry, false, out error);
+        }
+
+        public bool StartWithFixedPriority(AppEntry entry, bool forceRestartExisting, out string error)
         {
             EnsureEntryId(entry);
             error = null;
@@ -66,21 +47,55 @@ namespace PriorityControl.Services
                 return false;
             }
 
-            RuntimeState existingState;
-            if (_states.TryGetValue(entry.Id, out existingState))
+            if (forceRestartExisting)
             {
-                if (IsProcessAlive(existingState.Process))
+                SafeJobHandle forcedJobHandle;
+                if (!TryCreateManagedJobHandle(entry.Id, out forcedJobHandle, out error))
                 {
-                    error = "Process is already running for this entry.";
                     return false;
                 }
 
-                CleanupState(entry.Id);
+                using (forcedJobHandle)
+                {
+                    Process forcedProcess;
+                    if (!RestartTargetProcessInJob(entry.ExePath, forcedJobHandle, out forcedProcess, out error))
+                    {
+                        return false;
+                    }
+
+                    forcedProcess.Dispose();
+
+                    bool forcedBound = TryBindAndPinMatchingProcesses(
+                        entry.ExePath,
+                        forcedJobHandle,
+                        BindDurationNewProcessMs,
+                        BindRetryIntervalMs);
+
+                    if (!forcedBound)
+                    {
+                        error = "Failed to bind running process to PriorityControl job.";
+                        return false;
+                    }
+
+                    if (!_jobObjectService.ApplyPriorityLimit(forcedJobHandle, entry.Priority, out error))
+                    {
+                        return false;
+                    }
+
+                    TrySetPriorityForProcessesInJob(entry.ExePath, forcedJobHandle, entry.Priority);
+                }
+
+                entry.ProcessId = null;
+                entry.IsPriorityLocked = true;
+                entry.RuntimeStatus = "Running, locked";
+                return true;
             }
 
-            Process process = FindRunningProcessByPath(entry.ExePath);
-            bool startedNew = false;
+            Process process;
+            bool startedNew;
 
+            process = FindFirstRunningProcessByPath(entry.ExePath);
+            startedNew = false;
             if (process == null)
             {
                 process = StartProcess(entry.ExePath, out error);
@@ -92,7 +107,8 @@ namespace PriorityControl.Services
                 startedNew = true;
             }
 
-            if (!TryManageProcess(entry, process, true, out error))
+            SafeJobHandle jobHandle;
+            if (!TryCreateManagedJobHandle(entry.Id, out jobHandle, out error))
             {
                 if (startedNew)
                 {
@@ -106,7 +122,99 @@ namespace PriorityControl.Services
                 return false;
             }
 
-            return true;
+            try
+            {
+                if (!TryEnsureProcessAssignedToJob(process, jobHandle, out error))
+                {
+                    if (startedNew)
+                    {
+                        Process replacement = WaitForMatchingProcessByPath(entry.ExePath, process.Id, 5000);
+                        if (replacement != null)
+                        {
+                            process.Dispose();
+                            process = replacement;
+
+                            if (!TryEnsureProcessAssignedToJob(process, jobHandle, out error))
+                            {
+                                ShutdownProcessOnFailedStart(process);
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            ShutdownProcessOnFailedStart(process);
+                            return false;
+                        }
+                    }
+                    else if (!startedNew &&
+                        error != null &&
+                        error.IndexOf("another Job Object", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        process.Dispose();
+
+                        string restartError;
+                        Process restarted = RestartTargetProcess(entry.ExePath, out restartError);
+                        if (restarted == null)
+                        {
+                            error = restartError;
+                            return false;
+                        }
+
+                        process = restarted;
+                        startedNew = true;
+
+                        if (!TryEnsureProcessAssignedToJob(process, jobHandle, out error))
+                        {
+                            ShutdownProcessOnFailedStart(process);
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        process.Dispose();
+                        return false;
+                    }
+                }
+
+                if (!_jobObjectService.ApplyPriorityLimit(jobHandle, entry.Priority, out error))
+                {
+                    if (startedNew)
+                    {
+                        ShutdownProcessOnFailedStart(process);
+                    }
+                    else
+                    {
+                        process.Dispose();
+                    }
+
+                    return false;
+                }
+
+                string priorityError;
+                TrySetProcessPriority(process, entry.Priority, out priorityError);
+                process.Dispose();
+
+                bool boundToAtLeastOne = TryBindAndPinMatchingProcesses(
+                    entry.ExePath,
+                    jobHandle,
+                    startedNew ? BindDurationNewProcessMs : BindDurationExistingProcessMs,
+                    BindRetryIntervalMs);
+
+                if (!boundToAtLeastOne)
+                {
+                    error = "Failed to bind running process to PriorityControl job.";
+                    return false;
+                }
+
+                entry.ProcessId = null;
+                entry.IsPriorityLocked = true;
+                entry.RuntimeStatus = "Running, locked";
+                return true;
+            }
+            finally
+            {
+                jobHandle.Dispose();
+            }
         }
 
         public bool RemovePriorityLock(AppEntry entry, out string error)
@@ -114,99 +222,42 @@ namespace PriorityControl.Services
             EnsureEntryId(entry);
             error = null;
 
-            RuntimeState state;
-            if (!TryGetAliveState(entry.Id, out state))
+            List<int> runningPids = FindRunningProcessIdsByPath(entry.ExePath);
+            SafeJobHandle jobHandle;
+            if (!TryOpenKnownJobHandle(entry.Id, runningPids, out jobHandle))
             {
-                Process running = FindRunningProcessByPath(entry.ExePath);
-                if (running != null)
+                if (runningPids.Count > 0)
                 {
-                    running.Dispose();
-                    error = "Process is running but not managed by PriorityControl session.";
-                    return false;
+                    error = "Process is running but not in PriorityControl job.";
+                }
+                else
+                {
+                    error = "Process is not running.";
                 }
 
-                error = "Process is not running.";
                 return false;
             }
 
-            if (!_jobObjectService.RemovePriorityLimit(state.JobHandle, out error))
+            using (jobHandle)
             {
-                return false;
+                if (!_jobObjectService.RemovePriorityLimit(jobHandle, out error))
+                {
+                    return false;
+                }
             }
 
-            state.IsLockActive = false;
             entry.IsPriorityLocked = false;
             return true;
         }
 
         public bool ApplyPriorityLock(AppEntry entry, out string error)
         {
-            EnsureEntryId(entry);
-            error = null;
-
-            if (!EnsurePriorityPrivilege(entry.Priority, out error))
-            {
-                return false;
-            }
-
-            RuntimeState state;
-            if (!TryGetAliveState(entry.Id, out state))
-            {
-                if (!TryAttachToRunningProcess(entry, out state, out error))
-                {
-                    return false;
-                }
-            }
-
-            if (!_jobObjectService.ApplyPriorityLimit(state.JobHandle, entry.Priority, out error))
-            {
-                return false;
-            }
-
-            TrySetProcessPriority(state.Process, entry.Priority, out error);
-            state.IsLockActive = true;
-            entry.IsPriorityLocked = true;
-            return true;
+            return ApplyOrUpdatePriorityLock(entry, out error);
         }
 
         public bool UpdateLockedPriority(AppEntry entry, out string error)
         {
-            EnsureEntryId(entry);
-            error = null;
-
-            if (!EnsurePriorityPrivilege(entry.Priority, out error))
-            {
-                return false;
-            }
-
-            RuntimeState state;
-            if (!TryGetAliveState(entry.Id, out state))
-            {
-                Process running = FindRunningProcessByPath(entry.ExePath);
-                if (running != null)
-                {
-                    running.Dispose();
-                    error = "Process is running but not managed. Click 'Apply priority lock' first.";
-                    return false;
-                }
-
-                error = "Process is not running.";
-                return false;
-            }
-
-            if (!state.IsLockActive)
-            {
-                error = "Priority lock is not active for this process.";
-                return false;
-            }
-
-            if (!_jobObjectService.ApplyPriorityLimit(state.JobHandle, entry.Priority, out error))
-            {
-                return false;
-            }
-
-            TrySetProcessPriority(state.Process, entry.Priority, out error);
-            return true;
+            return ApplyOrUpdatePriorityLock(entry, out error);
         }
 
         public void RefreshStatus(AppEntry entry)
@@ -216,9 +267,8 @@ namespace PriorityControl.Services
                 return;
             }
 
-            var list = new List<AppEntry>(1);
-            list.Add(entry);
-            RefreshStatuses(list);
+            var one = new List<AppEntry>(1) { entry };
+            RefreshStatuses(one);
         }
 
         public void RefreshStatuses(IList<AppEntry> entries)
@@ -227,10 +277,6 @@ namespace PriorityControl.Services
             {
                 return;
             }
-
-            CleanupDeadStates();
-            Dictionary<string, ExternalProcessSnapshot> external =
-                BuildExternalProcessSnapshot(entries);
 
             foreach (AppEntry entry in entries)
             {
@@ -241,155 +287,385 @@ namespace PriorityControl.Services
 
                 EnsureEntryId(entry);
 
-                RuntimeState state;
-                if (TryGetAliveState(entry.Id, out state))
+                List<Process> processes = FindRunningProcessesByPath(entry.ExePath);
+                if (processes.Count == 0)
                 {
-                    UpdateManagedEntryStatus(entry, state);
+                    SetNotRunning(entry);
                     continue;
                 }
 
-                string key = NormalizePath(entry.ExePath);
-                ExternalProcessSnapshot snapshot;
-                if (external.TryGetValue(key, out snapshot))
+                List<int> pids = new List<int>(processes.Count);
+                for (int i = 0; i < processes.Count; i++)
                 {
-                    entry.ProcessId = snapshot.ProcessId;
-                    entry.IsPriorityLocked = false;
+                    pids.Add(processes[i].Id);
+                }
 
-                    if (snapshot.IsInAnyJob)
+                Process statusProcess = processes[0];
+                bool knownLockEnabled = false;
+                string knownJobPriorityDisplay = "Unknown";
+                bool knownJobFound = false;
+
+                SafeJobHandle knownJobHandle;
+                if (TryOpenKnownJobHandle(entry.Id, pids, out knownJobHandle))
+                {
+                    using (knownJobHandle)
                     {
-                        entry.RuntimeStatus = "Running, external/in job (" + snapshot.PriorityDisplay + ")";
+                        knownJobFound = true;
+
+                        Process managedProcess = FindFirstProcessInJob(processes, knownJobHandle);
+                        if (managedProcess != null)
+                        {
+                            statusProcess = managedProcess;
+                        }
+
+                        uint knownPriorityClass;
+                        string queryError;
+                        if (_jobObjectService.TryReadPriorityLimit(
+                            knownJobHandle,
+                            out knownPriorityClass,
+                            out knownLockEnabled,
+                            out queryError))
+                        {
+                            knownJobPriorityDisplay = PriorityMapper.ToDisplay(knownPriorityClass);
+                        }
+                        else
+                        {
+                            knownLockEnabled = false;
+                        }
+                    }
+                }
+
+                entry.ProcessId = statusProcess.Id;
+
+                uint selectedPriorityClass;
+                bool hasPriority = TryGetPriorityClass(statusProcess, out selectedPriorityClass);
+                string selectedPriority = hasPriority
+                    ? PriorityMapper.ToDisplay(selectedPriorityClass)
+                    : "Unknown";
+
+                if (knownJobFound)
+                {
+                    if (knownLockEnabled)
+                    {
+                        entry.IsPriorityLocked = true;
+                        if (selectedPriority != knownJobPriorityDisplay)
+                        {
+                            entry.RuntimeStatus = "Running, locked (priority mismatch)";
+                        }
+                        else
+                        {
+                            entry.RuntimeStatus = "Running, locked (" + knownJobPriorityDisplay + ")";
+                        }
                     }
                     else
                     {
-                        entry.RuntimeStatus = "Running, not locked (" + snapshot.PriorityDisplay + ")";
+                        entry.IsPriorityLocked = false;
+                        bool inAnyJob;
+                        TryIsProcessInAnyJob(statusProcess, out inAnyJob);
+                        entry.RuntimeStatus = inAnyJob
+                            ? "Running, external/in job (" + selectedPriority + ")"
+                            : "Running, not locked (" + selectedPriority + ")";
                     }
                 }
                 else
                 {
-                    SetNotRunning(entry);
+                    entry.IsPriorityLocked = false;
+                    bool inAnyJob;
+                    TryIsProcessInAnyJob(statusProcess, out inAnyJob);
+                    entry.RuntimeStatus = inAnyJob
+                        ? "Running, external/in job (" + selectedPriority + ")"
+                        : "Running, not locked (" + selectedPriority + ")";
+                }
+
+                for (int i = 0; i < processes.Count; i++)
+                {
+                    processes[i].Dispose();
                 }
             }
         }
 
         public bool IsManaged(string entryId)
         {
-            return !string.IsNullOrWhiteSpace(entryId) && _states.ContainsKey(entryId);
+            if (string.IsNullOrWhiteSpace(entryId))
+            {
+                return false;
+            }
+
+            SafeJobHandle handle;
+            if (!TryOpenKnownJobHandle(entryId, null, out handle))
+            {
+                return false;
+            }
+
+            handle.Dispose();
+            return true;
         }
 
         public void ReleaseEntry(AppEntry entry)
         {
-            EnsureEntryId(entry);
-            RuntimeState state;
-            if (!_states.TryGetValue(entry.Id, out state))
+            if (entry == null)
             {
                 return;
             }
 
-            if (IsProcessAlive(state.Process) && state.IsLockActive)
-            {
-                string ignoredError;
-                _jobObjectService.RemovePriorityLimit(state.JobHandle, out ignoredError);
-            }
-
-            CleanupState(entry.Id);
+            string ignoredError;
+            RemovePriorityLock(entry, out ignoredError);
         }
 
         public void Dispose()
         {
-            foreach (RuntimeState state in _states.Values)
-            {
-                if (state != null && IsProcessAlive(state.Process) && state.IsLockActive)
-                {
-                    string ignoredError;
-                    _jobObjectService.RemovePriorityLimit(state.JobHandle, out ignoredError);
-                }
-
-                if (state != null)
-                {
-                    state.Dispose();
-                }
-            }
-
-            _states.Clear();
+            // Stateless service: no persistent process/job handles are held.
         }
 
-        private bool TryAttachToRunningProcess(AppEntry entry, out RuntimeState state, out string error)
+        private bool ApplyOrUpdatePriorityLock(AppEntry entry, out string error)
         {
-            state = null;
+            EnsureEntryId(entry);
             error = null;
 
-            Process process = FindRunningProcessByPath(entry.ExePath);
+            if (!EnsurePriorityPrivilege(entry.Priority, out error))
+            {
+                return false;
+            }
+
+            Process process = FindFirstRunningProcessByPath(entry.ExePath);
             if (process == null)
             {
                 error = "Process is not running.";
                 return false;
             }
 
-            if (!TryManageProcess(entry, process, false, out error))
-            {
-                process.Dispose();
-                return false;
-            }
+            List<int> runningPids = FindRunningProcessIdsByPath(entry.ExePath);
+            SafeJobHandle jobHandle;
 
-            if (!_states.TryGetValue(entry.Id, out state))
+            if (!TryOpenKnownJobHandle(entry.Id, runningPids, out jobHandle))
             {
-                error = "Failed to track process state.";
-                return false;
-            }
-
-            return true;
-        }
-
-        private bool TryManageProcess(AppEntry entry, Process process, bool applyInitialLock, out string error)
-        {
-            error = null;
-            if (process == null)
-            {
-                error = "Process is not running.";
-                return false;
-            }
-
-            string jobName = string.Concat("PriorityControl_", entry.Id, "_", process.Id);
-            SafeJobHandle jobHandle = NativeMethods.CreateJobObject(IntPtr.Zero, jobName);
-            if (jobHandle == null || jobHandle.IsInvalid)
-            {
-                error = "CreateJobObject failed.";
-                return false;
-            }
-
-            if (applyInitialLock)
-            {
-                if (!_jobObjectService.ApplyPriorityLimit(jobHandle, entry.Priority, out error))
+                if (!TryCreateManagedJobHandle(entry.Id, out jobHandle, out error))
                 {
-                    jobHandle.Dispose();
+                    process.Dispose();
                     return false;
                 }
             }
 
-            if (!_jobObjectService.AssignProcess(jobHandle, process.Handle, out error))
+            using (jobHandle)
             {
-                bool inAnyJob;
-                if (TryIsProcessInAnyJob(process, out inAnyJob) && inAnyJob)
+                if (!TryEnsureProcessAssignedToJob(process, jobHandle, out error))
                 {
-                    error = "Process is already in another Job Object (cannot reassign).";
+                    process.Dispose();
+                    return false;
                 }
 
-                jobHandle.Dispose();
+                if (!_jobObjectService.ApplyPriorityLimit(jobHandle, entry.Priority, out error))
+                {
+                    process.Dispose();
+                    return false;
+                }
+
+                string priorityError;
+                TrySetProcessPriority(process, entry.Priority, out priorityError);
+
+                bool boundToAtLeastOne = TryBindAndPinMatchingProcesses(
+                    entry.ExePath,
+                    jobHandle,
+                    BindDurationExistingProcessMs,
+                    BindRetryIntervalMs);
+
+                if (!boundToAtLeastOne)
+                {
+                    process.Dispose();
+                    error = "Failed to bind running process to PriorityControl job.";
+                    return false;
+                }
+            }
+
+            process.Dispose();
+            entry.IsPriorityLocked = true;
+            return true;
+        }
+
+        private static Process RestartTargetProcess(string exePath, out string error)
+        {
+            error = null;
+
+            List<Process> running = FindRunningProcessesByPathStatic(exePath);
+            for (int i = 0; i < running.Count; i++)
+            {
+                try
+                {
+                    if (!running[i].HasExited)
+                    {
+                        running[i].Kill();
+                        running[i].WaitForExit(4000);
+                    }
+                }
+                catch
+                {
+                    // continue best-effort
+                }
+                finally
+                {
+                    running[i].Dispose();
+                }
+            }
+
+            return StartProcess(exePath, out error);
+        }
+
+        private bool RestartTargetProcessInJob(
+            string exePath,
+            SafeJobHandle jobHandle,
+            out Process process,
+            out string error)
+        {
+            process = null;
+            error = null;
+
+            List<Process> running = FindRunningProcessesByPathStatic(exePath);
+            for (int i = 0; i < running.Count; i++)
+            {
+                try
+                {
+                    if (!running[i].HasExited)
+                    {
+                        running[i].Kill();
+                        running[i].WaitForExit(4000);
+                    }
+                }
+                catch
+                {
+                    // continue best-effort
+                }
+                finally
+                {
+                    running[i].Dispose();
+                }
+            }
+
+            return StartProcessInJob(exePath, jobHandle, out process, out error);
+        }
+
+        private bool StartProcessInJob(
+            string exePath,
+            SafeJobHandle jobHandle,
+            out Process process,
+            out string error)
+        {
+            process = null;
+            error = null;
+
+            string workingDirectory = Path.GetDirectoryName(exePath);
+            if (string.IsNullOrWhiteSpace(workingDirectory))
+            {
+                workingDirectory = Environment.CurrentDirectory;
+            }
+
+            var startupInfo = new NativeMethods.STARTUPINFO();
+            startupInfo.cb = (uint)Marshal.SizeOf(typeof(NativeMethods.STARTUPINFO));
+
+            NativeMethods.PROCESS_INFORMATION processInfo;
+            string commandLine = "\"" + exePath + "\"";
+            bool created = NativeMethods.CreateProcess(
+                null,
+                commandLine,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                false,
+                NativeMethods.CREATE_SUSPENDED,
+                IntPtr.Zero,
+                workingDirectory,
+                ref startupInfo,
+                out processInfo);
+
+            if (!created)
+            {
+                error = "CreateProcess failed: Win32 " + Marshal.GetLastWin32Error();
                 return false;
             }
 
-            if (applyInitialLock)
+            bool success = false;
+            try
             {
-                string priorityError;
-                TrySetProcessPriority(process, entry.Priority, out priorityError);
+                string assignError;
+                if (!_jobObjectService.AssignProcess(jobHandle, processInfo.hProcess, out assignError))
+                {
+                    error = assignError;
+                    return false;
+                }
+
+                if (NativeMethods.ResumeThread(processInfo.hThread) == 0xFFFFFFFF)
+                {
+                    error = "ResumeThread failed: Win32 " + Marshal.GetLastWin32Error();
+                    return false;
+                }
+
+                process = Process.GetProcessById((int)processInfo.dwProcessId);
+                success = true;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = "Failed to start process in job: " + ex.Message;
+                return false;
+            }
+            finally
+            {
+                if (!success && processInfo.hProcess != IntPtr.Zero)
+                {
+                    try
+                    {
+                        Process.GetProcessById((int)processInfo.dwProcessId).Kill();
+                    }
+                    catch
+                    {
+                        // best effort
+                    }
+                }
+
+                if (processInfo.hThread != IntPtr.Zero)
+                {
+                    NativeMethods.CloseHandle(processInfo.hThread);
+                }
+
+                if (processInfo.hProcess != IntPtr.Zero)
+                {
+                    NativeMethods.CloseHandle(processInfo.hProcess);
+                }
+            }
+        }
+
+        private bool TryEnsureProcessAssignedToJob(Process process, SafeJobHandle jobHandle, out string error)
+        {
+            error = null;
+
+            bool inAnyJob;
+            if (TryIsProcessInAnyJob(process, out inAnyJob) && inAnyJob)
+            {
+                bool inThisJob;
+                if (NativeMethods.IsProcessInJob(
+                    process.Handle,
+                    jobHandle.DangerousGetHandle(),
+                    out inThisJob) && inThisJob)
+                {
+                    return true;
+                }
+
+                error = "Process is already in another Job Object (cannot reassign).";
+                return false;
             }
 
-            CleanupState(entry.Id);
-            _states[entry.Id] = new RuntimeState(process, jobHandle, applyInitialLock);
+            if (!_jobObjectService.AssignProcess(jobHandle, process.Handle, out error))
+            {
+                bool inThisJob;
+                if (NativeMethods.IsProcessInJob(
+                    process.Handle,
+                    jobHandle.DangerousGetHandle(),
+                    out inThisJob) && inThisJob)
+                {
+                    return true;
+                }
 
-            entry.ProcessId = process.Id;
-            entry.IsPriorityLocked = applyInitialLock;
-            entry.RuntimeStatus = applyInitialLock ? "Running, locked" : "Running, not locked";
+                return false;
+            }
+
             return true;
         }
 
@@ -426,27 +702,102 @@ namespace PriorityControl.Services
             }
         }
 
-        private Process FindRunningProcessByPath(string exePath)
+        private Process FindFirstRunningProcessByPath(string exePath)
         {
-            string normalizedTarget = NormalizePath(exePath);
-            if (string.IsNullOrWhiteSpace(normalizedTarget))
+            List<Process> list = FindRunningProcessesByPath(exePath);
+            if (list.Count == 0)
             {
                 return null;
             }
 
-            string name = null;
+            Process first = list[0];
+            for (int i = 1; i < list.Count; i++)
+            {
+                list[i].Dispose();
+            }
+
+            return first;
+        }
+
+        private Process WaitForMatchingProcessByPath(string exePath, int skipProcessId, int timeoutMs)
+        {
+            Stopwatch watch = Stopwatch.StartNew();
+
+            while (watch.ElapsedMilliseconds < timeoutMs)
+            {
+                List<Process> list = FindRunningProcessesByPath(exePath);
+                Process selected = null;
+                for (int i = 0; i < list.Count; i++)
+                {
+                    Process candidate = list[i];
+                    if (candidate.Id == skipProcessId)
+                    {
+                        candidate.Dispose();
+                        continue;
+                    }
+
+                    if (selected == null)
+                    {
+                        selected = candidate;
+                    }
+                    else
+                    {
+                        candidate.Dispose();
+                    }
+                }
+
+                if (selected != null)
+                {
+                    return selected;
+                }
+
+                Thread.Sleep(250);
+            }
+
+            return null;
+        }
+
+        private List<int> FindRunningProcessIdsByPath(string exePath)
+        {
+            var ids = new List<int>();
+            List<Process> list = FindRunningProcessesByPath(exePath);
+            for (int i = 0; i < list.Count; i++)
+            {
+                ids.Add(list[i].Id);
+                list[i].Dispose();
+            }
+
+            return ids;
+        }
+
+        private List<Process> FindRunningProcessesByPath(string exePath)
+        {
+            return FindRunningProcessesByPathStatic(exePath);
+        }
+
+        private static List<Process> FindRunningProcessesByPathStatic(string exePath)
+        {
+            var matches = new List<Process>();
+
+            string normalizedTarget = NormalizePath(exePath);
+            if (string.IsNullOrWhiteSpace(normalizedTarget))
+            {
+                return matches;
+            }
+
+            string name;
             try
             {
                 name = Path.GetFileNameWithoutExtension(normalizedTarget);
             }
             catch
             {
-                return null;
+                return matches;
             }
 
             if (string.IsNullOrWhiteSpace(name))
             {
-                return null;
+                return matches;
             }
 
             Process[] candidates;
@@ -456,13 +807,12 @@ namespace PriorityControl.Services
             }
             catch
             {
-                return null;
+                return matches;
             }
 
-            Process matched = null;
             foreach (Process process in candidates)
             {
-                bool keepProcess = false;
+                bool keep = false;
                 try
                 {
                     if (process.HasExited)
@@ -481,78 +831,156 @@ namespace PriorityControl.Services
                         normalizedTarget,
                         StringComparison.OrdinalIgnoreCase))
                     {
-                        matched = process;
-                        keepProcess = true;
-                        break;
+                        matches.Add(process);
+                        keep = true;
                     }
+                }
+                catch
+                {
+                    // Some processes can deny query access; skip them.
                 }
                 finally
                 {
-                    if (!keepProcess)
+                    if (!keep)
                     {
                         process.Dispose();
                     }
                 }
             }
 
-            if (matched == null)
+            return matches;
+        }
+
+        private bool TryOpenKnownJobHandle(string entryId, IList<int> candidateProcessIds, out SafeJobHandle jobHandle)
+        {
+            foreach (string stableName in BuildStableJobNames(entryId))
+            {
+                jobHandle = NativeMethods.OpenJobObject(KnownJobAccess, false, stableName);
+                if (jobHandle != null && !jobHandle.IsInvalid)
+                {
+                    return true;
+                }
+
+                if (jobHandle != null)
+                {
+                    jobHandle.Dispose();
+                }
+            }
+
+            if (candidateProcessIds != null)
+            {
+                for (int i = 0; i < candidateProcessIds.Count; i++)
+                {
+                    foreach (string legacyName in BuildLegacyJobNames(entryId, candidateProcessIds[i]))
+                    {
+                        jobHandle = NativeMethods.OpenJobObject(KnownJobAccess, false, legacyName);
+                        if (jobHandle != null && !jobHandle.IsInvalid)
+                        {
+                            return true;
+                        }
+
+                        if (jobHandle != null)
+                        {
+                            jobHandle.Dispose();
+                        }
+                    }
+                }
+            }
+
+            jobHandle = null;
+            return false;
+        }
+
+        private bool TryCreateManagedJobHandle(string entryId, out SafeJobHandle jobHandle, out string error)
+        {
+            jobHandle = null;
+            error = null;
+            int lastError = 0;
+
+            foreach (string stableName in BuildStableJobNames(entryId))
+            {
+                jobHandle = NativeMethods.CreateJobObject(IntPtr.Zero, stableName);
+                if (jobHandle != null && !jobHandle.IsInvalid)
+                {
+                    return true;
+                }
+
+                if (jobHandle != null)
+                {
+                    jobHandle.Dispose();
+                }
+
+                lastError = Marshal.GetLastWin32Error();
+            }
+
+            error = "CreateJobObject failed: Win32 " + lastError;
+            return false;
+        }
+
+        private static Process FindFirstProcessInJob(IList<Process> processes, SafeJobHandle jobHandle)
+        {
+            if (processes == null || jobHandle == null || jobHandle.IsInvalid)
             {
                 return null;
             }
 
-            return matched;
-        }
-
-        private Dictionary<string, ExternalProcessSnapshot> BuildExternalProcessSnapshot(IList<AppEntry> entries)
-        {
-            var result = new Dictionary<string, ExternalProcessSnapshot>(StringComparer.OrdinalIgnoreCase);
-            var processNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (AppEntry entry in entries)
+            IntPtr rawJobHandle = jobHandle.DangerousGetHandle();
+            for (int i = 0; i < processes.Count; i++)
             {
-                if (entry == null || string.IsNullOrWhiteSpace(entry.ExePath))
+                Process process = processes[i];
+                if (process == null)
                 {
                     continue;
                 }
 
-                string fullPath = NormalizePath(entry.ExePath);
-                if (string.IsNullOrWhiteSpace(fullPath))
-                {
-                    continue;
-                }
-
-                string fileNameWithoutExtension;
                 try
                 {
-                    fileNameWithoutExtension = Path.GetFileNameWithoutExtension(fullPath);
+                    bool inThisJob;
+                    if (NativeMethods.IsProcessInJob(process.Handle, rawJobHandle, out inThisJob) && inThisJob)
+                    {
+                        return process;
+                    }
                 }
                 catch
                 {
-                    continue;
+                    // ignore and continue
                 }
-
-                if (string.IsNullOrWhiteSpace(fileNameWithoutExtension))
-                {
-                    continue;
-                }
-
-                processNames.Add(fileNameWithoutExtension);
             }
 
-            foreach (string processName in processNames)
-            {
-                Process[] processes;
-                try
-                {
-                    processes = Process.GetProcessesByName(processName);
-                }
-                catch
-                {
-                    continue;
-                }
+            return null;
+        }
 
-                foreach (Process process in processes)
+        private bool TryBindAndPinMatchingProcesses(
+            string exePath,
+            SafeJobHandle jobHandle,
+            int durationMs,
+            int intervalMs)
+        {
+            if (jobHandle == null || jobHandle.IsInvalid)
+            {
+                return false;
+            }
+
+            if (durationMs < 0)
+            {
+                durationMs = 0;
+            }
+
+            if (intervalMs < 0)
+            {
+                intervalMs = 0;
+            }
+
+            bool hasAtLeastOneBoundProcess = false;
+            var pinnedProcessIds = new HashSet<int>();
+            Stopwatch watch = Stopwatch.StartNew();
+
+            while (true)
+            {
+                List<Process> processes = FindRunningProcessesByPath(exePath);
+                for (int i = 0; i < processes.Count; i++)
                 {
+                    Process process = processes[i];
                     try
                     {
                         if (process.HasExited)
@@ -560,143 +988,144 @@ namespace PriorityControl.Services
                             continue;
                         }
 
-                        string processPath;
-                        if (!TryGetProcessPath(process, out processPath))
+                        bool inThisJob;
+                        if (NativeMethods.IsProcessInJob(
+                            process.Handle,
+                            jobHandle.DangerousGetHandle(),
+                            out inThisJob) && inThisJob)
                         {
-                            continue;
+                            hasAtLeastOneBoundProcess = true;
+                        }
+                        else
+                        {
+                            bool inAnyJob;
+                            if (!(TryIsProcessInAnyJob(process, out inAnyJob) && inAnyJob))
+                            {
+                                string assignError;
+                                if (_jobObjectService.AssignProcess(jobHandle, process.Handle, out assignError))
+                                {
+                                    bool nowInThisJob;
+                                    if (NativeMethods.IsProcessInJob(
+                                        process.Handle,
+                                        jobHandle.DangerousGetHandle(),
+                                        out nowInThisJob) && nowInThisJob)
+                                    {
+                                        hasAtLeastOneBoundProcess = true;
+                                    }
+                                }
+                            }
                         }
 
-                        string normalized = NormalizePath(processPath);
-                        if (string.IsNullOrWhiteSpace(normalized) || result.ContainsKey(normalized))
+                        if (!pinnedProcessIds.Contains(process.Id) &&
+                            TryPinJobHandleInsideProcess(process, jobHandle))
                         {
-                            continue;
+                            pinnedProcessIds.Add(process.Id);
                         }
-
-                        uint priorityClass;
-                        bool hasPriority = TryGetPriorityClass(process, out priorityClass);
-
-                        bool isInAnyJob;
-                        TryIsProcessInAnyJob(process, out isInAnyJob);
-
-                        var snapshot = new ExternalProcessSnapshot();
-                        snapshot.ProcessId = process.Id;
-                        snapshot.PriorityDisplay = hasPriority ? PriorityMapper.ToDisplay(priorityClass) : "Unknown";
-                        snapshot.IsInAnyJob = isInAnyJob;
-
-                        result[normalized] = snapshot;
+                    }
+                    catch
+                    {
+                        // continue best effort
                     }
                     finally
                     {
                         process.Dispose();
                     }
                 }
-            }
 
-            return result;
-        }
-
-        private void UpdateManagedEntryStatus(AppEntry entry, RuntimeState state)
-        {
-            entry.ProcessId = state.Process.Id;
-
-            bool lockIsActive = state.IsLockActive;
-            uint queriedPriorityClass;
-            bool lockEnabledByJob;
-            string queryError;
-
-            if (_jobObjectService.TryReadPriorityLimit(
-                state.JobHandle,
-                out queriedPriorityClass,
-                out lockEnabledByJob,
-                out queryError))
-            {
-                lockIsActive = lockEnabledByJob;
-                state.IsLockActive = lockEnabledByJob;
-            }
-
-            entry.IsPriorityLocked = lockIsActive;
-
-            uint currentPriorityClass;
-            bool hasPriority = TryGetPriorityClass(state.Process, out currentPriorityClass);
-            string currentPriority = hasPriority ? PriorityMapper.ToDisplay(currentPriorityClass) : "Unknown";
-
-            if (lockIsActive)
-            {
-                uint expected = PriorityMapper.ToNative(entry.Priority);
-                if (hasPriority && currentPriorityClass != expected)
+                // As soon as we have at least one confirmed process in our job,
+                // we can return immediately to keep UI interactions responsive.
+                if (hasAtLeastOneBoundProcess)
                 {
-                    entry.RuntimeStatus = "Running, locked (priority mismatch)";
+                    return true;
                 }
-                else
-                {
-                    entry.RuntimeStatus = "Running, locked (" + currentPriority + ")";
-                }
-            }
-            else
-            {
-                entry.RuntimeStatus = "Running, not locked (" + currentPriority + ")";
-            }
-        }
 
-        private void CleanupDeadStates()
-        {
-            var deadIds = new List<string>();
-            foreach (KeyValuePair<string, RuntimeState> pair in _states)
-            {
-                if (!IsProcessAlive(pair.Value.Process))
+                if (watch.ElapsedMilliseconds >= durationMs)
                 {
-                    deadIds.Add(pair.Key);
+                    break;
+                }
+
+                if (intervalMs > 0)
+                {
+                    Thread.Sleep(intervalMs);
                 }
             }
 
-            foreach (string id in deadIds)
+            return hasAtLeastOneBoundProcess;
+        }
+
+        private void TrySetPriorityForProcessesInJob(
+            string exePath,
+            SafeJobHandle jobHandle,
+            FixedPriority priority)
+        {
+            if (jobHandle == null || jobHandle.IsInvalid)
             {
-                CleanupState(id);
+                return;
+            }
+
+            List<Process> processes = FindRunningProcessesByPath(exePath);
+            for (int i = 0; i < processes.Count; i++)
+            {
+                Process process = processes[i];
+                try
+                {
+                    bool inThisJob;
+                    if (NativeMethods.IsProcessInJob(
+                        process.Handle,
+                        jobHandle.DangerousGetHandle(),
+                        out inThisJob) && inThisJob)
+                    {
+                        string ignoredError;
+                        TrySetProcessPriority(process, priority, out ignoredError);
+                    }
+                }
+                catch
+                {
+                    // best effort
+                }
+                finally
+                {
+                    process.Dispose();
+                }
             }
         }
 
-        private bool TryGetAliveState(string entryId, out RuntimeState state)
+        private static bool TryPinJobHandleInsideProcess(Process process, SafeJobHandle jobHandle)
         {
-            state = null;
-            if (!_states.TryGetValue(entryId, out state))
+            if (process == null || jobHandle == null || jobHandle.IsInvalid)
             {
                 return false;
             }
 
-            if (IsProcessAlive(state.Process))
-            {
-                return true;
-            }
-
-            CleanupState(entryId);
-            state = null;
-            return false;
-        }
-
-        private void CleanupState(string entryId)
-        {
-            RuntimeState state;
-            if (_states.TryGetValue(entryId, out state))
-            {
-                _states.Remove(entryId);
-                state.Dispose();
-            }
-        }
-
-        private static bool IsProcessAlive(Process process)
-        {
-            if (process == null)
-            {
-                return false;
-            }
-
+            IntPtr targetProcessHandle = IntPtr.Zero;
             try
             {
-                return !process.HasExited;
+                targetProcessHandle = NativeMethods.OpenProcess(
+                    NativeMethods.PROCESS_DUP_HANDLE,
+                    false,
+                    process.Id);
+
+                if (targetProcessHandle == IntPtr.Zero)
+                {
+                    return false;
+                }
+
+                IntPtr duplicatedHandle;
+                return NativeMethods.DuplicateHandle(
+                    NativeMethods.GetCurrentProcess(),
+                    jobHandle.DangerousGetHandle(),
+                    targetProcessHandle,
+                    out duplicatedHandle,
+                    0,
+                    false,
+                    NativeMethods.DUPLICATE_SAME_ACCESS);
             }
-            catch
+            finally
             {
-                return false;
+                if (targetProcessHandle != IntPtr.Zero)
+                {
+                    NativeMethods.CloseHandle(targetProcessHandle);
+                }
             }
         }
 
@@ -708,19 +1137,35 @@ namespace PriorityControl.Services
                 return false;
             }
 
+            IntPtr processHandle = IntPtr.Zero;
             try
             {
-                if (process.MainModule == null)
+                processHandle = NativeMethods.OpenProcess(
+                    NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION,
+                    false,
+                    process.Id);
+
+                if (processHandle == IntPtr.Zero)
                 {
                     return false;
                 }
 
-                path = process.MainModule.FileName;
+                int capacity = 1024;
+                var builder = new StringBuilder(capacity);
+                if (!NativeMethods.QueryFullProcessImageName(processHandle, 0, builder, ref capacity))
+                {
+                    return false;
+                }
+
+                path = builder.ToString();
                 return !string.IsNullOrWhiteSpace(path);
             }
-            catch
+            finally
             {
-                return false;
+                if (processHandle != IntPtr.Zero)
+                {
+                    NativeMethods.CloseHandle(processHandle);
+                }
             }
         }
 
@@ -824,11 +1269,7 @@ namespace PriorityControl.Services
                 return true;
             }
 
-            error =
-                "Cannot set " +
-                priority +
-                ". " +
-                privilegeError;
+            error = "Cannot set " + priority + ". " + privilegeError;
             return false;
         }
 
@@ -848,6 +1289,22 @@ namespace PriorityControl.Services
             int win32Error = Marshal.GetLastWin32Error();
             error = "SetPriorityClass failed: Win32 " + win32Error;
             return false;
+        }
+
+        private static IEnumerable<string> BuildStableJobNames(string entryId)
+        {
+            foreach (string prefix in JobNamePrefixes)
+            {
+                yield return prefix + "PriorityControl_" + entryId;
+            }
+        }
+
+        private static IEnumerable<string> BuildLegacyJobNames(string entryId, int processId)
+        {
+            foreach (string prefix in JobNamePrefixes)
+            {
+                yield return prefix + "PriorityControl_" + entryId + "_" + processId;
+            }
         }
     }
 }
