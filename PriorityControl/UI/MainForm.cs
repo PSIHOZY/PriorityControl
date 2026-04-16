@@ -436,15 +436,9 @@ namespace PriorityControl.UI
 
                 if (errors.Length > 0)
                 {
-                    string diagnostics =
-                        Environment.NewLine +
-                        Environment.NewLine +
-                        "PriorityControl v" + GetDisplayVersion() +
-                        Environment.NewLine +
-                        Application.ExecutablePath;
                     MessageBox.Show(
                         this,
-                        errors.ToString().TrimEnd() + diagnostics,
+                        errors.ToString().TrimEnd() + BuildErrorDiagnostics(),
                         "Start errors",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Warning);
@@ -501,7 +495,12 @@ namespace PriorityControl.UI
 
                 if (errors.Length > 0)
                 {
-                    MessageBox.Show(this, errors.ToString(), "Lock errors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    MessageBox.Show(
+                        this,
+                        errors.ToString().TrimEnd() + BuildErrorDiagnostics(),
+                        "Lock errors",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
                 }
 
                 SetInfo(string.Format("Applied priority lock for {0} {1}.", locked, EntryWord(locked)));
@@ -546,7 +545,12 @@ namespace PriorityControl.UI
 
                 if (errors.Length > 0)
                 {
-                    MessageBox.Show(this, errors.ToString(), "Unlock errors", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    MessageBox.Show(
+                        this,
+                        errors.ToString().TrimEnd() + BuildErrorDiagnostics(),
+                        "Unlock errors",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
                 }
 
                 SetInfo(string.Format("Removed priority lock for {0} {1}.", unlocked, EntryWord(unlocked)));
@@ -788,6 +792,15 @@ namespace PriorityControl.UI
             }
 
             return Application.ProductVersion;
+        }
+
+        private static string BuildErrorDiagnostics()
+        {
+            return Environment.NewLine +
+                Environment.NewLine +
+                "PriorityControl v" + GetDisplayVersion() +
+                Environment.NewLine +
+                Application.ExecutablePath;
         }
 
         private void ClearGridSelection()

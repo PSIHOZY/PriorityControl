@@ -1,0 +1,7 @@
+PriorityControl/bin/
+PriorityControl/obj/
+*.user
+*.suo
+*.cache
+*.pdb
+*.log

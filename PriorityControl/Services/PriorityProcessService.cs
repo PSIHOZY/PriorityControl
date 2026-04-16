@@ -1004,6 +1004,7 @@ namespace PriorityControl.Services
                         }
 
                         bool processInManagedJob = false;
+                        bool assignedToManagedJobInThisPass = false;
                         bool inThisJob;
                         if (NativeMethods.IsProcessInJob(
                             process.Handle,
@@ -1029,12 +1030,14 @@ namespace PriorityControl.Services
                                     {
                                         hasAtLeastOneBoundProcess = true;
                                         processInManagedJob = true;
+                                        assignedToManagedJobInThisPass = true;
                                     }
                                 }
                             }
                         }
 
                         if (processInManagedJob &&
+                            assignedToManagedJobInThisPass &&
                             !pinnedProcessIds.Contains(process.Id))
                         {
                             string pinKey = BuildSessionPinKey(process);
@@ -1404,7 +1407,10 @@ namespace PriorityControl.Services
                     }
                 }
 
-                return bestPath ?? normalizedTarget;
+                if (!string.IsNullOrWhiteSpace(bestPath))
+                {
+                    return bestPath;
+                }
             }
             catch
             {
