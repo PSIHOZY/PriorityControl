@@ -24,7 +24,7 @@ namespace PriorityControl
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new MainForm(startedFromStartup, args));
+                Application.Run(new MainForm(startedFromStartup));
             }
         }
     }

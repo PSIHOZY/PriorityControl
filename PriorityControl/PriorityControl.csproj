@@ -13,6 +13,7 @@
     <Prefer32Bit>false</Prefer32Bit>
     <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
     <Deterministic>true</Deterministic>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <PlatformTarget>AnyCPU</PlatformTarget>
@@ -52,7 +53,6 @@
     <Compile Include="Native\SafeJobHandle.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
-    <Compile Include="Services\ElevationService.cs" />
     <Compile Include="Services\JobObjectService.cs" />
     <Compile Include="Services\PrivilegeService.cs" />
     <Compile Include="Services\PriorityMapper.cs" />

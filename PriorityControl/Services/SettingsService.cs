@@ -48,10 +48,22 @@ namespace PriorityControl.Services
             Normalize(settings);
             Directory.CreateDirectory(_settingsDirectory);
 
-            using (var stream = File.Create(GetSettingsPath()))
+            string path = GetSettingsPath();
+            string tempPath = path + ".tmp";
+
+            using (var stream = File.Create(tempPath))
             {
                 var serializer = new DataContractJsonSerializer(typeof(AppSettings));
                 serializer.WriteObject(stream, settings);
+            }
+
+            if (File.Exists(path))
+            {
+                File.Replace(tempPath, path, null);
+            }
+            else
+            {
+                File.Move(tempPath, path);
             }
         }
 

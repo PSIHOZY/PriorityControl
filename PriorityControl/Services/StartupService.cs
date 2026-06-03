@@ -1,4 +1,5 @@
 using Microsoft.Win32;
+using System;
 using System.Diagnostics;
 
 namespace PriorityControl.Services
@@ -11,15 +12,15 @@ namespace PriorityControl.Services
 
         public bool IsEnabled()
         {
-            return IsRunKeyEnabled();
+            return IsScheduledTaskEnabled() || IsRunKeyEnabled();
         }
 
         public void SetEnabled(bool enabled, string executablePath)
         {
             if (enabled)
             {
-                SetRunKey(executablePath);
-                DeleteScheduledTaskBestEffort();
+                CreateScheduledTask(executablePath);
+                RemoveRunKey();
                 return;
             }
 
@@ -34,7 +35,8 @@ namespace PriorityControl.Services
                 return;
             }
 
-            SetRunKey(executablePath);
+            CreateScheduledTask(executablePath);
+            RemoveRunKey();
         }
 
         private static bool IsRunKeyEnabled()
@@ -51,19 +53,32 @@ namespace PriorityControl.Services
             }
         }
 
-        private static void SetRunKey(string executablePath)
-        {
-            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, true) ?? Registry.CurrentUser.CreateSubKey(RunKeyPath))
-            {
-                key.SetValue(ValueName, "\"" + executablePath + "\" --startup");
-            }
-        }
-
         private static void RemoveRunKey()
         {
             using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, true) ?? Registry.CurrentUser.CreateSubKey(RunKeyPath))
             {
                 key.DeleteValue(ValueName, false);
+            }
+        }
+
+        private static bool IsScheduledTaskEnabled()
+        {
+            return RunSchtasks("/Query /TN \"" + TaskName + "\"") == 0;
+        }
+
+        private static void CreateScheduledTask(string executablePath)
+        {
+            string taskCommand = "\\\"" + executablePath + "\\\" --startup";
+            string arguments =
+                "/Create /SC ONLOGON /TN \"" + TaskName + "\" /TR \"" +
+                taskCommand +
+                "\" /RL HIGHEST /F";
+
+            int exitCode = RunSchtasks(arguments);
+            if (exitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    "Failed to create elevated startup task. schtasks exit code: " + exitCode);
             }
         }
 
@@ -79,9 +94,7 @@ namespace PriorityControl.Services
                 FileName = "schtasks.exe",
                 Arguments = arguments,
                 UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
+                CreateNoWindow = true
             };
 
             try
@@ -93,7 +106,20 @@ namespace PriorityControl.Services
                         return -1;
                     }
 
-                    process.WaitForExit(5000);
+                    if (!process.WaitForExit(5000))
+                    {
+                        try
+                        {
+                            process.Kill();
+                        }
+                        catch
+                        {
+                            // best effort
+                        }
+
+                        return -1;
+                    }
+
                     return process.ExitCode;
                 }
             }

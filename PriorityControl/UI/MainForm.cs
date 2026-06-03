@@ -20,14 +20,12 @@ namespace PriorityControl.UI
 
         private readonly SettingsService _settingsService = new SettingsService();
         private readonly StartupService _startupService = new StartupService();
-        private readonly ElevationService _elevationService = new ElevationService();
         private readonly PriorityProcessService _processService = new PriorityProcessService();
 
         private readonly BindingList<AppEntry> _entries = new BindingList<AppEntry>();
         private readonly BindingSource _entriesSource = new BindingSource();
 
         private readonly bool _startedFromStartup;
-        private readonly string[] _launchArgs;
 
         private bool _isInitializing;
         private bool _isGridEditing;
@@ -40,16 +38,13 @@ namespace PriorityControl.UI
         private Button _lockButton;
         private Button _unlockButton;
         private Button _refreshButton;
-        private Button _restartAsAdminButton;
         private CheckBox _startWithWindowsCheckBox;
-        private Label _adminModeLabel;
         private Label _infoLabel;
         private Timer _statusTimer;
 
-        public MainForm(bool startedFromStartup, string[] launchArgs)
+        public MainForm(bool startedFromStartup)
         {
             _startedFromStartup = startedFromStartup;
-            _launchArgs = launchArgs ?? new string[0];
 
             InitializeComponent();
 
@@ -59,7 +54,6 @@ namespace PriorityControl.UI
             }
 
             LoadFromSettings();
-            UpdateAdminState();
             RefreshAllStatuses();
             UpdateButtonsState();
 
@@ -114,22 +108,6 @@ namespace PriorityControl.UI
                 WrapContents = false
             };
             layout.Controls.Add(topPanel, 0, 0);
-
-            _adminModeLabel = new Label
-            {
-                AutoSize = true,
-                Margin = new Padding(0, 11, 15, 0)
-            };
-            topPanel.Controls.Add(_adminModeLabel);
-
-            _restartAsAdminButton = new Button
-            {
-                Text = "Restart as administrator",
-                AutoSize = true,
-                Margin = new Padding(0, 6, 15, 0)
-            };
-            _restartAsAdminButton.Click += RestartAsAdminButton_Click;
-            topPanel.Controls.Add(_restartAsAdminButton);
 
             _startWithWindowsCheckBox = new CheckBox
             {
@@ -386,35 +364,6 @@ namespace PriorityControl.UI
                     return;
                 }
 
-                bool needsAdmin = selectedEntries.Any(entry =>
-                    entry.Priority == FixedPriority.High || entry.Priority == FixedPriority.Realtime);
-
-                if (needsAdmin && !_elevationService.IsAdministrator)
-                {
-                    DialogResult result = MessageBox.Show(
-                        this,
-                        "High/Realtime priorities require administrator rights.\nRestart PriorityControl as administrator now?",
-                        "Administrator rights required",
-                        MessageBoxButtons.YesNo,
-                        MessageBoxIcon.Warning);
-
-                    if (result == DialogResult.Yes)
-                    {
-                        string restartError;
-                        if (_elevationService.TryRestartElevated(_launchArgs, out restartError))
-                        {
-                            Close();
-                            return;
-                        }
-
-                        SetInfo(restartError, true);
-                        return;
-                    }
-
-                    SetInfo("Start canceled: administrator rights were not granted.", true);
-                    return;
-                }
-
                 int startedCount = 0;
                 var errors = new StringBuilder();
 
@@ -436,12 +385,7 @@ namespace PriorityControl.UI
 
                 if (errors.Length > 0)
                 {
-                    MessageBox.Show(
-                        this,
-                        errors.ToString().TrimEnd() + BuildErrorDiagnostics(),
-                        "Start errors",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
+                    ShowErrors(errors, "Start errors");
                 }
 
                 SetInfo(string.Format("Started {0} {1} with fixed priority.", startedCount, EntryWord(startedCount)));
@@ -466,15 +410,6 @@ namespace PriorityControl.UI
                     return;
                 }
 
-                bool needsAdmin = selectedEntries.Any(entry =>
-                    entry.Priority == FixedPriority.High || entry.Priority == FixedPriority.Realtime);
-
-                if (needsAdmin && !_elevationService.IsAdministrator)
-                {
-                    SetInfo("High/Realtime lock requires administrator rights.", true);
-                    return;
-                }
-
                 int locked = 0;
                 var errors = new StringBuilder();
 
@@ -495,12 +430,7 @@ namespace PriorityControl.UI
 
                 if (errors.Length > 0)
                 {
-                    MessageBox.Show(
-                        this,
-                        errors.ToString().TrimEnd() + BuildErrorDiagnostics(),
-                        "Lock errors",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
+                    ShowErrors(errors, "Lock errors");
                 }
 
                 SetInfo(string.Format("Applied priority lock for {0} {1}.", locked, EntryWord(locked)));
@@ -545,12 +475,7 @@ namespace PriorityControl.UI
 
                 if (errors.Length > 0)
                 {
-                    MessageBox.Show(
-                        this,
-                        errors.ToString().TrimEnd() + BuildErrorDiagnostics(),
-                        "Unlock errors",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
+                    ShowErrors(errors, "Unlock errors");
                 }
 
                 SetInfo(string.Format("Removed priority lock for {0} {1}.", unlocked, EntryWord(unlocked)));
@@ -560,24 +485,6 @@ namespace PriorityControl.UI
                 UseWaitCursor = false;
                 _statusTimer.Start();
             }
-        }
-
-        private void RestartAsAdminButton_Click(object sender, EventArgs e)
-        {
-            if (_elevationService.IsAdministrator)
-            {
-                SetInfo("Already running as administrator.");
-                return;
-            }
-
-            string restartError;
-            if (_elevationService.TryRestartElevated(_launchArgs, out restartError))
-            {
-                Close();
-                return;
-            }
-
-            SetInfo(restartError, true);
         }
 
         private void StartWithWindowsCheckBox_CheckedChanged(object sender, EventArgs e)
@@ -658,7 +565,6 @@ namespace PriorityControl.UI
         {
             _processService.RefreshStatuses(_entries);
 
-            UpdateAdminState();
             UpdateButtonsState();
             _grid.Invalidate();
         }
@@ -675,38 +581,11 @@ namespace PriorityControl.UI
                 return;
             }
 
-            bool requiresAdmin = startupEntries.Any(entry =>
-                entry.Priority == FixedPriority.High || entry.Priority == FixedPriority.Realtime);
-
-            if (requiresAdmin && !_elevationService.IsAdministrator)
-            {
-                string elevationError;
-                if (_elevationService.TryRestartElevated(_launchArgs, out elevationError))
-                {
-                    Close();
-                    return;
-                }
-
-                SetInfo("Startup mode failed to elevate: " + elevationError, true);
-                return;
-            }
-
             int started = 0;
             var errors = new StringBuilder();
 
             foreach (AppEntry entry in startupEntries)
             {
-                bool needsAdmin = entry.Priority == FixedPriority.High || entry.Priority == FixedPriority.Realtime;
-                if (needsAdmin && !_elevationService.IsAdministrator)
-                {
-                    errors.AppendLine(
-                        Path.GetFileName(entry.ExePath) +
-                        ": requires administrator rights for " +
-                        entry.Priority +
-                        ".");
-                    continue;
-                }
-
                 string startError;
                 if (_processService.StartWithFixedPriority(entry, true, out startError))
                 {
@@ -754,15 +633,6 @@ namespace PriorityControl.UI
             return selected;
         }
 
-        private void UpdateAdminState()
-        {
-            bool isAdmin = _elevationService.IsAdministrator;
-            _adminModeLabel.Text = isAdmin
-                ? "Administrator mode: ON"
-                : "Administrator mode: OFF";
-            _adminModeLabel.ForeColor = isAdmin ? Color.FromArgb(25, 110, 48) : Color.DarkRed;
-        }
-
         private void UpdateButtonsState()
         {
             bool hasSelection = GetSelectedEntries().Count > 0;
@@ -776,6 +646,21 @@ namespace PriorityControl.UI
         {
             _infoLabel.ForeColor = isError ? Color.DarkRed : Color.FromArgb(30, 30, 30);
             _infoLabel.Text = message;
+        }
+
+        private void ShowErrors(StringBuilder errors, string title)
+        {
+            if (errors == null || errors.Length == 0)
+            {
+                return;
+            }
+
+            MessageBox.Show(
+                this,
+                errors.ToString().TrimEnd() + BuildErrorDiagnostics(),
+                title,
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
         }
 
         private static string EntryWord(int count)
